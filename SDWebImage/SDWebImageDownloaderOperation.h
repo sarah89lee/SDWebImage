@@ -17,10 +17,12 @@ extern NSString *const SDWebImageDownloadFinishNotification;
 
 @interface SDWebImageDownloaderOperation : NSOperation <SDWebImageOperation>
 
+// YOU MAY NOT MODIFY PROPERTIES WHEN OPERATION HAS BEEN STARTED!
+
 /**
  * The request used by the operation's connection.
  */
-@property (strong, nonatomic, readonly) NSURLRequest *request;
+@property (copy, atomic, readonly) NSURLRequest *request;
 
 
 @property (assign, nonatomic) BOOL shouldDecompressImages;
@@ -30,19 +32,19 @@ extern NSString *const SDWebImageDownloadFinishNotification;
  *
  * This is the value that is returned in the `NSURLConnectionDelegate` method `-connectionShouldUseCredentialStorage:`.
  */
-@property (nonatomic, assign) BOOL shouldUseCredentialStorage;
+@property (atomic, assign) BOOL shouldUseCredentialStorage;
 
 /**
  * The credential used for authentication challenges in `-connection:didReceiveAuthenticationChallenge:`.
  *
  * This will be overridden by any shared credentials that exist for the username or password of the request URL, if present.
  */
-@property (nonatomic, strong) NSURLCredential *credential;
+@property (atomic, copy) NSURLCredential *credential;
 
 /**
  * The SDWebImageDownloaderOptions for the receiver.
  */
-@property (assign, nonatomic, readonly) SDWebImageDownloaderOptions options;
+@property (assign, atomic, readonly) SDWebImageDownloaderOptions options;
 
 /**
  * The expected size of data.
@@ -61,9 +63,9 @@ extern NSString *const SDWebImageDownloadFinishNotification;
  *
  *  @param request        the URL request
  *  @param options        downloader options
- *  @param progressBlock  the block executed when a new chunk of data arrives. 
+ *  @param progressBlock  the block executed when a new chunk of data arrives.
  *                        @note the progress block is executed on a background queue
- *  @param completedBlock the block executed when the download is done. 
+ *  @param completedBlock the block executed when the download is done.
  *                        @note the completed block is executed on the main queue for success. If errors are found, there is a chance the block will be executed on a background queue
  *  @param cancelBlock    the block executed if the download (operation) is cancelled
  *
@@ -72,7 +74,6 @@ extern NSString *const SDWebImageDownloadFinishNotification;
 - (id)initWithRequest:(NSURLRequest *)request
               options:(SDWebImageDownloaderOptions)options
              progress:(SDWebImageDownloaderProgressBlock)progressBlock
-            completed:(SDWebImageDownloaderCompletedBlock)completedBlock
-            cancelled:(SDWebImageNoParamsBlock)cancelBlock;
+            completed:(SDWebImageDownloaderCompletedBlock)completedBlock;
 
 @end

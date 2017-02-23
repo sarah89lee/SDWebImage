@@ -6,223 +6,193 @@
  * file that was distributed with this source code.
  */
 
-#import "SDWebImageDownloader.h"
-#import "SDWebImageDownloaderOperation.h"
-#import <ImageIO/ImageIO.h>
+#import <Foundation/Foundation.h>
+#import "SDWebImageCompat.h"
+#import "SDWebImageOperation.h"
 
-static NSString *const kProgressCallbackKey = @"progress";
-static NSString *const kCompletedCallbackKey = @"completed";
+typedef NS_OPTIONS(NSUInteger, SDWebImageDownloaderOptions) {
+    SDWebImageDownloaderLowPriority = 1 << 0,
+    SDWebImageDownloaderProgressiveDownload = 1 << 1,
+    
+    /**
+     * By default, request prevent the of NSURLCache. With this flag, NSURLCache
+     * is used with default policies.
+     */
+    SDWebImageDownloaderUseNSURLCache = 1 << 2,
+    
+    /**
+     * Call completion block with nil image/imageData if the image was read from NSURLCache
+     * (to be combined with `SDWebImageDownloaderUseNSURLCache`).
+     */
+    
+    SDWebImageDownloaderIgnoreCachedResponse = 1 << 3,
+    /**
+     * In iOS 4+, continue the download of the image if the app goes to background. This is achieved by asking the system for
+     * extra time in background to let the request finish. If the background task expires the operation will be cancelled.
+     */
+    
+    SDWebImageDownloaderContinueInBackground = 1 << 4,
+    
+    /**
+     * Handles cookies stored in NSHTTPCookieStore by setting
+     * NSMutableURLRequest.HTTPShouldHandleCookies = YES;
+     */
+    SDWebImageDownloaderHandleCookies = 1 << 5,
+    
+    /**
+     * Enable to allow untrusted SSL certificates.
+     * Useful for testing purposes. Use with caution in production.
+     */
+    SDWebImageDownloaderAllowInvalidSSLCertificates = 1 << 6,
+    
+    /**
+     * Put the image in the high priority queue.
+     */
+    SDWebImageDownloaderHighPriority = 1 << 7,
+};
 
-@interface SDWebImageDownloader ()
+typedef NS_ENUM(NSInteger, SDWebImageDownloaderExecutionOrder) {
+    /**
+     * Default value. All download operations will execute in queue style (first-in-first-out).
+     */
+    SDWebImageDownloaderFIFOExecutionOrder,
+    
+    /**
+     * All download operations will execute in stack style (last-in-first-out).
+     */
+    SDWebImageDownloaderLIFOExecutionOrder
+};
 
-@property (strong, nonatomic) NSOperationQueue *downloadQueue;
-@property (weak, nonatomic) NSOperation *lastAddedOperation;
-@property (assign, nonatomic) Class operationClass;
-@property (strong, nonatomic) NSMutableDictionary *URLCallbacks;
-@property (strong, nonatomic) NSMutableDictionary *HTTPHeaders;
-// This queue is used to serialize the handling of the network responses of all the download operation in a single queue
-@property (SDDispatchQueueSetterSementics, nonatomic) dispatch_queue_t barrierQueue;
+extern NSString *const SDWebImageDownloadStartNotification;
+extern NSString *const SDWebImageDownloadStopNotification;
+
+typedef void(^SDWebImageDownloaderProgressBlock)(NSInteger receivedSize, NSInteger expectedSize);
+typedef void(^SDWebImageDownloaderCompletedBlock)(UIImage *image, NSData *data, NSError *error, BOOL finished);
+
+typedef NSDictionary *(^SDWebImageDownloaderHeadersFilterBlock)(NSURL *url, NSDictionary *headers);
+
+@class SDWebImageDownloaderOperation;
+@protocol SDWebImageDownloaderObserver <NSObject>
+
+@required
+- (void)progress:(SDWebImageDownloaderOperation *)downloadOperation receivedSize:(NSUInteger)receivedSize expectedSize:(NSUInteger)expectedSize;
+- (void)completed:(SDWebImageDownloaderOperation *)downloadOperation image:(UIImage *)image data:(NSData *)data error:(NSError *)error finished:(BOOL)finished;
 
 @end
 
-@implementation SDWebImageDownloader
+/**
+ * Asynchronous downloader dedicated and optimized for image loading.
+ */
+@interface SDWebImageDownloader : NSObject
 
-+ (void)initialize {
-    // Bind SDNetworkActivityIndicator if available (download it here: http://github.com/rs/SDNetworkActivityIndicator )
-    // To use it, just add #import "SDNetworkActivityIndicator.h" in addition to the SDWebImage import
-    if (NSClassFromString(@"SDNetworkActivityIndicator")) {
+/**
+ * Decompressing images that are downloaded and cached can improve performance but can consume lot of memory.
+ * Defaults to YES. Set this to NO if you are experiencing a crash due to excessive memory consumption.
+ */
+@property (assign, nonatomic) BOOL shouldDecompressImages;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id activityIndicator = [NSClassFromString(@"SDNetworkActivityIndicator") performSelector:NSSelectorFromString(@"sharedActivityIndicator")];
-#pragma clang diagnostic pop
+@property (assign, nonatomic) NSInteger maxConcurrentDownloads;
 
-        // Remove observer in case it was previously added.
-        [[NSNotificationCenter defaultCenter] removeObserver:activityIndicator name:SDWebImageDownloadStartNotification object:nil];
-        [[NSNotificationCenter defaultCenter] removeObserver:activityIndicator name:SDWebImageDownloadStopNotification object:nil];
+/**
+ * Shows the current amount of downloads that still need to be downloaded
+ */
+@property (readonly, nonatomic) NSUInteger currentDownloadCount;
 
-        [[NSNotificationCenter defaultCenter] addObserver:activityIndicator
-                                                 selector:NSSelectorFromString(@"startActivity")
-                                                     name:SDWebImageDownloadStartNotification object:nil];
-        [[NSNotificationCenter defaultCenter] addObserver:activityIndicator
-                                                 selector:NSSelectorFromString(@"stopActivity")
-                                                     name:SDWebImageDownloadStopNotification object:nil];
-    }
-}
 
-+ (SDWebImageDownloader *)sharedDownloader {
-    static dispatch_once_t once;
-    static id instance;
-    dispatch_once(&once, ^{
-        instance = [self new];
-    });
-    return instance;
-}
+/**
+ *  The timeout value (in seconds) for the download operation. Default: 15.0.
+ */
+@property (assign, nonatomic) NSTimeInterval downloadTimeout;
 
-- (id)init {
-    if ((self = [super init])) {
-        _operationClass = [SDWebImageDownloaderOperation class];
-        _shouldDecompressImages = YES;
-        _executionOrder = SDWebImageDownloaderFIFOExecutionOrder;
-        _downloadQueue = [NSOperationQueue new];
-        _downloadQueue.maxConcurrentOperationCount = 6;
-        _URLCallbacks = [NSMutableDictionary new];
-#ifdef SD_WEBP
-        _HTTPHeaders = [@{@"Accept": @"image/webp,image/*;q=0.8"} mutableCopy];
-#else
-        _HTTPHeaders = [@{@"Accept": @"image/*;q=0.8"} mutableCopy];
-#endif
-        _barrierQueue = dispatch_queue_create("com.hackemist.SDWebImageDownloaderBarrierQueue", DISPATCH_QUEUE_CONCURRENT);
-        _downloadTimeout = 15.0;
-    }
-    return self;
-}
 
-- (void)dealloc {
-    [self.downloadQueue cancelAllOperations];
-    SDDispatchQueueRelease(_barrierQueue);
-}
+/**
+ * Changes download operations execution order. Default value is `SDWebImageDownloaderFIFOExecutionOrder`.
+ */
+@property (assign, nonatomic) SDWebImageDownloaderExecutionOrder executionOrder;
 
-- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
-    if (value) {
-        self.HTTPHeaders[field] = value;
-    }
-    else {
-        [self.HTTPHeaders removeObjectForKey:field];
-    }
-}
+/**
+ *  Singleton method, returns the shared instance
+ *
+ *  @return global shared instance of downloader class
+ */
++ (SDWebImageDownloader *)sharedDownloader;
 
-- (NSString *)valueForHTTPHeaderField:(NSString *)field {
-    return self.HTTPHeaders[field];
-}
+/**
+ *  Set the default URL credential to be set for request operations.
+ */
+@property (strong, nonatomic) NSURLCredential *urlCredential;
 
-- (void)setMaxConcurrentDownloads:(NSInteger)maxConcurrentDownloads {
-    _downloadQueue.maxConcurrentOperationCount = maxConcurrentDownloads;
-}
+/**
+ * Set username
+ */
+@property (strong, nonatomic) NSString *username;
 
-- (NSUInteger)currentDownloadCount {
-    return _downloadQueue.operationCount;
-}
+/**
+ * Set password
+ */
+@property (strong, nonatomic) NSString *password;
 
-- (NSInteger)maxConcurrentDownloads {
-    return _downloadQueue.maxConcurrentOperationCount;
-}
+/**
+ * Set filter to pick headers for downloading image HTTP request.
+ *
+ * This block will be invoked for each downloading image request, returned
+ * NSDictionary will be used as headers in corresponding HTTP request.
+ */
+@property (nonatomic, copy) SDWebImageDownloaderHeadersFilterBlock headersFilter;
 
-- (void)setOperationClass:(Class)operationClass {
-    _operationClass = operationClass ?: [SDWebImageDownloaderOperation class];
-}
+/**
+ * Set a value for a HTTP header to be appended to each download HTTP request.
+ *
+ * @param value The value for the header field. Use `nil` value to remove the header.
+ * @param field The name of the header field to set.
+ */
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field;
 
-- (id <SDWebImageOperation>)downloadImageWithURL:(NSURL *)url options:(SDWebImageDownloaderOptions)options progress:(SDWebImageDownloaderProgressBlock)progressBlock completed:(SDWebImageDownloaderCompletedBlock)completedBlock {
-    __block SDWebImageDownloaderOperation *operation;
-    __weak __typeof(self)wself = self;
+/**
+ * Returns the value of the specified HTTP header field.
+ *
+ * @return The value associated with the header field field, or `nil` if there is no corresponding header field.
+ */
+- (NSString *)valueForHTTPHeaderField:(NSString *)field;
 
-    [self addProgressCallback:progressBlock andCompletedBlock:completedBlock forURL:url createCallback:^{
-        NSTimeInterval timeoutInterval = wself.downloadTimeout;
-        if (timeoutInterval == 0.0) {
-            timeoutInterval = 15.0;
-        }
+/**
+ * Sets a subclass of `SDWebImageDownloaderOperation` as the default
+ * `NSOperation` to be used each time SDWebImage constructs a request
+ * operation to download an image.
+ *
+ * @param operationClass The subclass of `SDWebImageDownloaderOperation` to set
+ *        as default. Passing `nil` will revert to `SDWebImageDownloaderOperation`.
+ */
+- (void)setOperationClass:(Class)operationClass;
 
-        // In order to prevent from potential duplicate caching (NSURLCache + SDImageCache) we disable the cache for image requests if told otherwise
-        NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:url cachePolicy:(options & SDWebImageDownloaderUseNSURLCache ? NSURLRequestUseProtocolCachePolicy : NSURLRequestReloadIgnoringLocalCacheData) timeoutInterval:timeoutInterval];
-        request.HTTPShouldHandleCookies = (options & SDWebImageDownloaderHandleCookies);
-        request.HTTPShouldUsePipelining = YES;
-        if (wself.headersFilter) {
-            request.allHTTPHeaderFields = wself.headersFilter(url, [wself.HTTPHeaders copy]);
-        }
-        else {
-            request.allHTTPHeaderFields = wself.HTTPHeaders;
-        }
-        operation = [[wself.operationClass alloc] initWithRequest:request
-                                                          options:options
-                                                         progress:^(NSInteger receivedSize, NSInteger expectedSize) {
-                                                             SDWebImageDownloader *sself = wself;
-                                                             if (!sself) return;
-                                                             __block NSArray *callbacksForURL;
-                                                             dispatch_sync(sself.barrierQueue, ^{
-                                                                 callbacksForURL = [sself.URLCallbacks[url] copy];
-                                                             });
-                                                             for (NSDictionary *callbacks in callbacksForURL) {
-                                                                 SDWebImageDownloaderProgressBlock callback = callbacks[kProgressCallbackKey];
-                                                                 if (callback) callback(receivedSize, expectedSize);
-                                                             }
-                                                         }
-                                                        completed:^(UIImage *image, NSData *data, NSError *error, BOOL finished) {
-                                                            SDWebImageDownloader *sself = wself;
-                                                            if (!sself) return;
-                                                            __block NSArray *callbacksForURL;
-                                                            dispatch_barrier_sync(sself.barrierQueue, ^{
-                                                                callbacksForURL = [sself.URLCallbacks[url] copy];
-                                                                if (finished) {
-                                                                    [sself.URLCallbacks removeObjectForKey:url];
-                                                                }
-                                                            });
-                                                            for (NSDictionary *callbacks in callbacksForURL) {
-                                                                SDWebImageDownloaderCompletedBlock callback = callbacks[kCompletedCallbackKey];
-                                                                if (callback) callback(image, data, error, finished);
-                                                            }
-                                                        }
-                                                        cancelled:^{
-                                                            SDWebImageDownloader *sself = wself;
-                                                            if (!sself) return;
-                                                            dispatch_barrier_async(sself.barrierQueue, ^{
-                                                                [sself.URLCallbacks removeObjectForKey:url];
-                                                            });
-                                                        }];
-        operation.shouldDecompressImages = wself.shouldDecompressImages;
-        
-        if (wself.username && wself.password) {
-            operation.credential = [NSURLCredential credentialWithUser:wself.username password:wself.password persistence:NSURLCredentialPersistenceForSession];
-        }
-        
-        if (options & SDWebImageDownloaderHighPriority) {
-            operation.queuePriority = NSOperationQueuePriorityHigh;
-        } else if (options & SDWebImageDownloaderLowPriority) {
-            operation.queuePriority = NSOperationQueuePriorityLow;
-        }
+/**
+ * Creates a SDWebImageDownloader async downloader instance with a given URL
+ *
+ * The delegate will be informed when the image is finish downloaded or an error has happen.
+ *
+ * @see SDWebImageDownloaderDelegate
+ *
+ * @param url            The URL to the image to download
+ * @param options        The options to be used for this download
+ * @param progressBlock  A block called repeatedly while the image is downloading
+ * @param completedBlock A block called once the download is completed.
+ *                       If the download succeeded, the image parameter is set, in case of error,
+ *                       error parameter is set with the error. The last parameter is always YES
+ *                       if SDWebImageDownloaderProgressiveDownload isn't use. With the
+ *                       SDWebImageDownloaderProgressiveDownload option, this block is called
+ *                       repeatedly with the partial image object and the finished argument set to NO
+ *                       before to be called a last time with the full image and finished argument
+ *                       set to YES. In case of error, the finished argument is always YES.
+ *
+ * @return A cancellable SDWebImageOperation
+ */
+- (void)downloadImageWithURL:(NSURL *)url options:(SDWebImageDownloaderOptions)options observer:(id<SDWebImageDownloaderObserver>)observer;
 
-        [wself.downloadQueue addOperation:operation];
-        if (wself.executionOrder == SDWebImageDownloaderLIFOExecutionOrder) {
-            // Emulate LIFO execution order by systematically adding new operations as last operation's dependency
-            [wself.lastAddedOperation addDependency:operation];
-            wself.lastAddedOperation = operation;
-        }
-    }];
+- (void)cancelDownloadImageWithURL:(NSURL *)url forObserver:(id<SDWebImageDownloaderObserver>)observer;
 
-    return operation;
-}
-
-- (void)addProgressCallback:(SDWebImageDownloaderProgressBlock)progressBlock andCompletedBlock:(SDWebImageDownloaderCompletedBlock)completedBlock forURL:(NSURL *)url createCallback:(SDWebImageNoParamsBlock)createCallback {
-    // The URL will be used as the key to the callbacks dictionary so it cannot be nil. If it is nil immediately call the completed block with no image or data.
-    if (url == nil) {
-        if (completedBlock != nil) {
-            completedBlock(nil, nil, nil, NO);
-        }
-        return;
-    }
-
-    dispatch_barrier_sync(self.barrierQueue, ^{
-        BOOL first = NO;
-        if (!self.URLCallbacks[url]) {
-            self.URLCallbacks[url] = [NSMutableArray new];
-            first = YES;
-        }
-
-        // Handle single download of simultaneous download request for the same URL
-        NSMutableArray *callbacksForURL = self.URLCallbacks[url];
-        NSMutableDictionary *callbacks = [NSMutableDictionary new];
-        if (progressBlock) callbacks[kProgressCallbackKey] = [progressBlock copy];
-        if (completedBlock) callbacks[kCompletedCallbackKey] = [completedBlock copy];
-        [callbacksForURL addObject:callbacks];
-        self.URLCallbacks[url] = callbacksForURL;
-
-        if (first) {
-            createCallback();
-        }
-    });
-}
-
-- (void)setSuspended:(BOOL)suspended {
-    [self.downloadQueue setSuspended:suspended];
-}
+/**
+ * Sets the download queue suspension state
+ */
+- (void)setSuspended:(BOOL)suspended;
 
 @end
